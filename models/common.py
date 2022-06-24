@@ -31,7 +31,7 @@ from utils.torch_utils import copy_attr, time_sync
 def autopad(k, p=None):  # kernel, padding
     # Pad to 'same'
     if p is None:
-        p = k // 2 if isinstance(k, int) else [x // 2 for x in k]  # auto-pad
+        p = k // 2 if isinstance(k, int) else (x // 2 for x in k)  # auto-pad
     return p
 
 
@@ -54,12 +54,6 @@ class DWConv(Conv):
     # Depth-wise convolution class
     def __init__(self, c1, c2, k=1, s=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
         super().__init__(c1, c2, k, s, g=math.gcd(c1, c2), act=act)
-
-
-class DWConvTranspose2d(nn.ConvTranspose2d):
-    # Depth-wise transpose convolution class
-    def __init__(self, c1, c2, k=1, s=1, p1=0, p2=0):  # ch_in, ch_out, kernel, stride, padding, padding_out
-        super().__init__(c1, c2, k, s, p1, p2, groups=math.gcd(c1, c2))
 
 
 class TransformerLayer(nn.Module):
@@ -130,20 +124,6 @@ class BottleneckCSP(nn.Module):
         return self.cv4(self.act(self.bn(torch.cat((y1, y2), 1))))
 
 
-class CrossConv(nn.Module):
-    # Cross Convolution Downsample
-    def __init__(self, c1, c2, k=3, s=1, g=1, e=1.0, shortcut=False):
-        # ch_in, ch_out, kernel, stride, groups, expansion, shortcut
-        super().__init__()
-        c_ = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_, (1, k), (1, s))
-        self.cv2 = Conv(c_, c2, (k, 1), (s, 1), g=g)
-        self.add = shortcut and c1 == c2
-
-    def forward(self, x):
-        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
-
-
 class C3(nn.Module):
     # CSP Bottleneck with 3 convolutions
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
@@ -153,18 +133,89 @@ class C3(nn.Module):
         self.cv2 = Conv(c1, c_, 1, 1)
         self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+        # self.m = nn.Sequential(*(CrossConv(c_, c_, 3, 1, g, 1.0, shortcut) for _ in range(n)))
 
     def forward(self, x):
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
+class Conv_CBAM(nn.Module):
+    # Standard convolution
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
+        super(Conv_CBAM, self).__init__()
+        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.Hardswish() if act else nn.Identity()
+        self.ca = ChannelAttention(c2)
+        self.sa = SpatialAttention()
 
+    def forward(self, x):
+        x = self.act(self.bn(self.conv(x)))
+        x = self.ca(x) * x
+        x = self.sa(x) * x
+        return x
 
-class C3x(C3):
-    # C3 module with cross-convolutions
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
-        super().__init__(c1, c2, n, shortcut, g, e)
-        c_ = int(c2 * e)
-        self.m = nn.Sequential(*(CrossConv(c_, c_, 3, 1, g, 1.0, shortcut) for _ in range(n)))
+    def fuseforward(self, x):
+        return self.act(self.conv(x))
 
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+ 
+        self.f1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu = nn.ReLU()
+        self.f2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        # 写法二,亦可使用顺序容器
+        # self.sharedMLP = nn.Sequential(
+        # nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False), nn.ReLU(),
+        # nn.Conv2d(in_planes // rotio, in_planes, 1, bias=False))
+ 
+        self.sigmoid = nn.Sigmoid()
+ 
+    def forward(self, x):
+        avg_out = self.f2(self.relu(self.f1(self.avg_pool(x))))
+        max_out = self.f2(self.relu(self.f1(self.max_pool(x))))
+        out = self.sigmoid(avg_out + max_out)
+        return out
+ 
+ 
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+ 
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+ 
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+ 
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv(x)
+        return self.sigmoid(x)
+ 
+ 
+class CBAMC3(nn.Module):
+    # CSP Bottleneck with 3 convolutions
+    def __init__(self, c1, c2, ratio=16, kernel_size=7):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super(CBAMC3, self).__init__()
+        # c_ = int(c2 * e)  # hidden channels
+        # self.cv1 = Conv(c1, c_, 1, 1)
+        # self.cv2 = Conv(c1, c_, 1, 1)
+        # self.cv3 = Conv(2 * c_, c2, 1)
+        # self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+        self.channel_attention = ChannelAttention(c1, ratio)
+        self.spatial_attention = SpatialAttention(kernel_size)
+ 
+        # self.m = nn.Sequential(*[CrossConv(c_, c_, 3, 1, g, 1.0, shortcut) for _ in range(n)])
+ 
+    def forward(self, x):
+        out = self.channel_attention(x) * x
+        # print('outchannels:{}'.format(out.shape))
+        out = self.spatial_attention(out) * out
+        return out
 
 class C3TR(C3):
     # C3 module with TransformerBlock()
@@ -323,15 +374,15 @@ class DetectMultiBackend(nn.Module):
         super().__init__()
         w = str(weights[0] if isinstance(weights, list) else weights)
         pt, jit, onnx, xml, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs = self.model_type(w)  # get backend
+        stride, names = 32, [f'class{i}' for i in range(1000)]  # assign defaults
         w = attempt_download(w)  # download if not local
         fp16 &= (pt or jit or onnx or engine) and device.type != 'cpu'  # FP16
-        stride, names = 32, [f'class{i}' for i in range(1000)]  # assign defaults
-        if data:  # assign class names (optional)
+        if data:  # data.yaml path (optional)
             with open(data, errors='ignore') as f:
-                names = yaml.safe_load(f)['names']
+                names = yaml.safe_load(f)['names']  # class names
 
         if pt:  # PyTorch
-            model = attempt_load(weights if isinstance(weights, list) else w, device=device)
+            model = attempt_load(weights if isinstance(weights, list) else w, map_location=device)
             stride = max(int(model.stride.max()), 32)  # model stride
             names = model.module.names if hasattr(model, 'module') else model.names  # get class names
             model.half() if fp16 else model.float()
@@ -360,17 +411,13 @@ class DetectMultiBackend(nn.Module):
                 stride, names = int(meta['stride']), eval(meta['names'])
         elif xml:  # OpenVINO
             LOGGER.info(f'Loading {w} for OpenVINO inference...')
-            check_requirements(('openvino',))  # requires openvino-dev: https://pypi.org/project/openvino-dev/
-            from openvino.runtime import Core
-            ie = Core()
+            check_requirements(('openvino-dev',))  # requires openvino-dev: https://pypi.org/project/openvino-dev/
+            import openvino.inference_engine as ie
+            core = ie.IECore()
             if not Path(w).is_file():  # if not *.xml
                 w = next(Path(w).glob('*.xml'))  # get *.xml file from *_openvino_model dir
-            network = ie.read_model(model=w, weights=Path(w).with_suffix('.bin'))
-            executable_network = ie.compile_model(model=network, device_name="CPU")
-            output_layer = next(iter(executable_network.outputs))
-            meta = Path(w).with_suffix('.yaml')
-            if meta.exists():
-                stride, names = self._load_metadata(meta)  # load metadata
+            network = core.read_network(model=w, weights=Path(w).with_suffix('.bin'))  # *.xml, *.bin paths
+            executable_network = core.load_network(network, device_name='CPU', num_requests=1)
         elif engine:  # TensorRT
             LOGGER.info(f'Loading {w} for TensorRT inference...')
             import tensorrt as trt  # https://developer.nvidia.com/nvidia-tensorrt-download
@@ -454,7 +501,11 @@ class DetectMultiBackend(nn.Module):
             y = self.session.run([self.session.get_outputs()[0].name], {self.session.get_inputs()[0].name: im})[0]
         elif self.xml:  # OpenVINO
             im = im.cpu().numpy()  # FP32
-            y = self.executable_network([im])[self.output_layer]
+            desc = self.ie.TensorDesc(precision='FP32', dims=im.shape, layout='NCHW')  # Tensor Description
+            request = self.executable_network.requests[0]  # inference request
+            request.set_blob(blob_name='images', blob=self.ie.Blob(desc, im))  # name=next(iter(request.input_blobs))
+            request.infer()
+            y = request.output_blobs['output'].buffer  # name=next(iter(request.output_blobs))
         elif self.engine:  # TensorRT
             assert im.shape == self.bindings['images'].shape, (im.shape, self.bindings['images'].shape)
             self.binding_addrs['images'] = int(im.data_ptr())
@@ -498,11 +549,11 @@ class DetectMultiBackend(nn.Module):
 
     def warmup(self, imgsz=(1, 3, 640, 640)):
         # Warmup model by running inference once
-        warmup_types = self.pt, self.jit, self.onnx, self.engine, self.saved_model, self.pb
-        if any(warmup_types) and self.device.type != 'cpu':
-            im = torch.zeros(*imgsz, dtype=torch.half if self.fp16 else torch.float, device=self.device)  # input
-            for _ in range(2 if self.jit else 1):  #
-                self.forward(im)  # warmup
+        if any((self.pt, self.jit, self.onnx, self.engine, self.saved_model, self.pb)):  # warmup types
+            if self.device.type != 'cpu':  # only warmup GPU models
+                im = torch.zeros(*imgsz, dtype=torch.half if self.fp16 else torch.float, device=self.device)  # input
+                for _ in range(2 if self.jit else 1):  #
+                    self.forward(im)  # warmup
 
     @staticmethod
     def model_type(p='path/to/model.pt'):
@@ -516,13 +567,6 @@ class DetectMultiBackend(nn.Module):
         tflite &= not edgetpu  # *.tflite
         return pt, jit, onnx, xml, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs
 
-    @staticmethod
-    def _load_metadata(f='path/to/meta.yaml'):
-        # Load metadata from meta.yaml if it exists
-        with open(f, errors='ignore') as f:
-            d = yaml.safe_load(f)
-        return d['stride'], d['names']  # assign stride, names
-
 
 class AutoShape(nn.Module):
     # YOLOv5 input-robust model wrapper for passing cv2/np/PIL/torch inputs. Includes preprocessing, inference and NMS
@@ -534,10 +578,9 @@ class AutoShape(nn.Module):
     max_det = 1000  # maximum number of detections per image
     amp = False  # Automatic Mixed Precision (AMP) inference
 
-    def __init__(self, model, verbose=True):
+    def __init__(self, model):
         super().__init__()
-        if verbose:
-            LOGGER.info('Adding AutoShape... ')
+        LOGGER.info('Adding AutoShape... ')
         copy_attr(self, model, include=('yaml', 'nc', 'hyp', 'names', 'stride', 'abc'), exclude=())  # copy attributes
         self.dmb = isinstance(model, DetectMultiBackend)  # DetectMultiBackend() instance
         self.pt = not self.dmb or model.pt  # PyTorch model
